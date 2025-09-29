@@ -344,33 +344,14 @@ app.post("/quizzes", async (req, res) => {
 
   console.log("Incoming quiz payload:", { title, subject, week, className });
 
-  // Step 1: Find the lesson
-  const { data: lesson, error: lessonError } = await supabase
-    .from("lessons")
-    .select("id")
-    .eq("title", title)
-    .eq("subject", subject)
-    .eq("week", week)
-    .eq("class", className)  
-    .maybeSingle();
-
-  if (lessonError || !lesson) {
-    console.error("Lesson lookup failed:", lessonError, "Lesson:", lesson);
-    return res.status(404).json({ error: "Lesson not found" });
-  }
-
-  console.log("Found lesson:", lesson);
-
-  // Step 2: Save quiz
   const { data, error } = await supabase
     .from("quizzes")
     .insert([{
-      lesson_id: lesson.id,
-      class: className,  
+      class: className,
       subject,
       data: quizData,
-      Week:week,
-      title:title
+      Week: week,
+      title
     }])
     .select();
 
@@ -382,6 +363,7 @@ app.post("/quizzes", async (req, res) => {
   console.log("Quiz saved:", data);
   res.json(data[0]);
 });
+
 
 
 
