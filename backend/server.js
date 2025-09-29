@@ -4,58 +4,88 @@ const multer = require('multer');
 const mammoth = require('mammoth');
 const path = require("path");
 const fs = require("fs");
-const cors=require('cors')
+const cors = require('cors');
 const axios = require("axios");
-const cheerio=require('cheerio')
+const cheerio = require('cheerio');
 const app = express();
 
 const upload = multer({ dest: "uploads/" });
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
-
-
-// Enhanced HTTP client with better connection management
+// Enhanced HTTP client with connection management
 const httpClient = axios.create({
-  timeout: 30000,
+  baseURL: 'https://translation-api-1k7k.onrender.com',
+  timeout: 45000, // Increased timeout
   maxRedirects: 5,
   httpAgent: new require('http').Agent({ 
     keepAlive: true,
-    maxSockets: 10,
-    maxFreeSockets: 5,
-    timeout: 30000
-  })
+    keepAliveMsecs: 60000,
+    maxSockets: 20,
+    maxFreeSockets: 10,
+    timeout: 45000
+  }),
+  headers: {
+    'Content-Type': 'application/json',
+    'Connection': 'keep-alive'
+  }
 });
 
-// Rate limiter for translation API
+// Improved Rate Limiter with queue system
 class RateLimiter {
   constructor(maxRequests, timeWindow) {
     this.maxRequests = maxRequests;
     this.timeWindow = timeWindow;
     this.requests = [];
+    this.queue = [];
+    this.processing = false;
   }
 
   async wait() {
-    const now = Date.now();
-    this.requests = this.requests.filter(time => now - time < this.timeWindow);
+    return new Promise((resolve) => {
+      this.queue.push(resolve);
+      if (!this.processing) {
+        this.processQueue();
+      }
+    });
+  }
+
+  async processQueue() {
+    if (this.processing || this.queue.length === 0) return;
     
-    if (this.requests.length >= this.maxRequests) {
-      const oldest = this.requests[0];
-      const waitTime = this.timeWindow - (now - oldest);
-      await new Promise(resolve => setTimeout(resolve, waitTime + 100));
+    this.processing = true;
+    
+    while (this.queue.length > 0) {
+      const now = Date.now();
+      
+      // Clean old requests
+      this.requests = this.requests.filter(time => now - time < this.timeWindow);
+      
+      if (this.requests.length < this.maxRequests) {
+        const resolve = this.queue.shift();
+        this.requests.push(now);
+        resolve();
+        
+        // Small delay between requests in the same batch
+        await new Promise(r => setTimeout(r, 100));
+      } else {
+        const oldest = this.requests[0];
+        const waitTime = this.timeWindow - (now - oldest);
+        await new Promise(r => setTimeout(r, waitTime + 50));
+      }
     }
     
-    this.requests.push(now);
+    this.processing = false;
   }
 }
 
-const translationLimiter = new RateLimiter(5, 1000); // 5 requests per second
+const translationLimiter = new RateLimiter(3, 1500); // 3 requests per 1.5 seconds
 
-// Smart batching with priority
+// Sequential processing instead of parallel for stability
 async function translateHtmlStructureOptimized(htmlEnglish) {
   const $ = cheerio.load(htmlEnglish, { decodeEntities: false });
   
-  // Collect and prioritize text nodes
+  // Collect text nodes
   const textNodes = [];
   
   $('*').each((i, element) => {
@@ -69,7 +99,6 @@ async function translateHtmlStructureOptimized(htmlEnglish) {
         const trimmedText = originalText.trim();
         
         if (trimmedText.length > 1 && !isOnlyNumbers(trimmedText)) {
-          // Priority: headings > strong/b > li > p > others
           let priority = 0;
           switch(element.tagName.toLowerCase()) {
             case 'h1': priority = 5; break;
@@ -99,8 +128,8 @@ async function translateHtmlStructureOptimized(htmlEnglish) {
   // Sort by priority (highest first)
   textNodes.sort((a, b) => b.priority - a.priority);
 
-  // Process in optimized batches
-  await processTranslationBatches(textNodes);
+  // Process sequentially for stability
+  await processSequentialTranslation(textNodes);
   
   return $.html();
 }
@@ -109,53 +138,61 @@ function isOnlyNumbers(str) {
   return /^\d+$/.test(str.replace(/[.,]/g, ''));
 }
 
-async function processTranslationBatches(textNodes) {
-  const BATCH_SIZE = 8; // Smaller batches for stability
-  const DELAY_BETWEEN_BATCHES = 500; // Increased delay
+async function processSequentialTranslation(textNodes) {
+  const BATCH_SIZE = 1; // Process one at a time for maximum stability
+  const DELAY_BETWEEN_REQUESTS = 500;
   
+  let successCount = 0;
+  let failCount = 0;
+
   for (let i = 0; i < textNodes.length; i += BATCH_SIZE) {
     const batch = textNodes.slice(i, i + BATCH_SIZE);
-    console.log(`Processing batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(textNodes.length/BATCH_SIZE)}`);
+    console.log(`Processing item ${i + 1}/${textNodes.length}`);
     
     try {
-      await processBatch(batch);
+      await processBatchSequential(batch);
+      successCount += batch.length;
       
-      // Delay between batches to prevent overwhelming the API
+      // Delay between requests
       if (i + BATCH_SIZE < textNodes.length) {
-        await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_BATCHES));
+        await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_REQUESTS));
       }
     } catch (error) {
-      console.error(`Batch ${Math.floor(i/BATCH_SIZE) + 1} failed:`, error.message);
-      // Continue with next batch instead of failing completely
+      console.error(`Batch failed:`, error.message);
+      failCount += batch.length;
+      // Continue with next items
+    }
+  }
+
+  console.log(`Translation completed: ${successCount} successful, ${failCount} failed`);
+}
+
+async function processBatchSequential(batch) {
+  for (let i = 0; i < batch.length; i++) {
+    const item = batch[i];
+    try {
+      await translationLimiter.wait();
+      
+      const translated = await translateWithRetry(item.trimmedText, item.tagName, i);
+      if (translated && translated.trim().length > 0) {
+        item.node.data = item.originalText.replace(item.trimmedText, translated);
+        console.log(`✓ Translated: "${item.trimmedText.substring(0, 30)}..."`);
+      }
+    } catch (error) {
+      console.warn(`✗ Failed: "${item.trimmedText.substring(0, 30)}..." - ${error.message}`);
+      // Keep original text on failure
     }
   }
 }
 
-async function processBatch(batch) {
-  const promises = batch.map((item, index) => 
-    translateWithRetry(item.trimmedText, item.tagName, index)
-      .then(translated => {
-        if (translated && translated.trim().length > 0) {
-          item.node.data = item.originalText.replace(item.trimmedText, translated);
-        }
-      })
-      .catch(error => {
-        console.warn(`Failed to translate: "${item.trimmedText.substring(0, 50)}..."`, error.message);
-        // Keep original text on failure
-      })
-  );
-
-  await Promise.allSettled(promises);
-}
-
-async function translateWithRetry(text, tagName, index, maxRetries = 3) {
+async function translateWithRetry(text, tagName, index, maxRetries = 5) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       await translationLimiter.wait();
       
-      // Stagger requests within batch
+      // Stagger requests
       if (index > 0) {
-        await new Promise(resolve => setTimeout(resolve, index * 50));
+        await new Promise(resolve => setTimeout(resolve, index * 100));
       }
 
       const contextHint = getContextHint(tagName);
@@ -166,7 +203,7 @@ async function translateWithRetry(text, tagName, index, maxRetries = 3) {
         preserve_formatting: true
       };
 
-      const response = await httpClient.post("https://translation-api-1k7k.onrender.com/translate", payload);
+      const response = await httpClient.post("/translate", payload);
       
       if (response.data && response.data.translatedText) {
         return response.data.translatedText;
@@ -174,14 +211,16 @@ async function translateWithRetry(text, tagName, index, maxRetries = 3) {
         throw new Error('Invalid response format');
       }
     } catch (error) {
-      console.warn(`Attempt ${attempt} failed for: "${text.substring(0, 30)}..."`, error.message);
+      console.warn(`Attempt ${attempt}/${maxRetries} failed for: "${text.substring(0, 30)}..."`, error.message);
       
       if (attempt === maxRetries) {
-        throw error;
+        throw new Error(`All retries failed: ${error.message}`);
       }
       
-      // Exponential backoff
-      const backoffTime = Math.pow(2, attempt) * 1000;
+      // Exponential backoff with jitter
+      const baseDelay = Math.pow(2, attempt) * 1000;
+      const jitter = Math.random() * 1000;
+      const backoffTime = baseDelay + jitter;
       await new Promise(resolve => setTimeout(resolve, backoffTime));
     }
   }
@@ -200,32 +239,14 @@ function getContextHint(tagName) {
   }
 }
 
-// Progress tracking for large documents
-let progressInterval;
-function startProgressTracking(totalNodes) {
-  let processed = 0;
-  console.log(`Starting translation of ${totalNodes} text nodes...`);
-  
-  progressInterval = setInterval(() => {
-    processed++;
-    if (processed % 50 === 0) {
-      console.log(`Progress: ${processed}/${totalNodes} (${Math.round((processed/totalNodes)*100)}%)`);
-    }
-  }, 100);
-}
-
-function stopProgressTracking() {
-  if (progressInterval) {
-    clearInterval(progressInterval);
-  }
-}
-
 app.post('/upload', upload.single("file"), async (req, res) => {
+  let filePath = null;
+  
   try {
     if (!req.file) return res.status(400).json({ error: "no file uploaded" });
 
     const { title, subject, week, className } = req.body;
-    const filePath = req.file.path;
+    filePath = req.file.path;
 
     const ext = path.extname(req.file.originalname || "").toLowerCase();
     if (ext !== ".docx") {
@@ -267,7 +288,12 @@ app.post('/upload', upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: error.message });
     }
 
-    fs.unlink(filePath, () => {});
+    // Clean up file
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlink(filePath, (err) => {
+        if (err) console.error("Error deleting file:", err);
+      });
+    }
 
     res.json({
       success: true,
@@ -277,15 +303,23 @@ app.post('/upload', upload.single("file"), async (req, res) => {
 
   } catch (err) {
     console.error("Upload error:", err);
-    if (req.file && req.file.path) {
-      fs.unlinkSync(req.file.path);
+    
+    // Clean up file on error
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (unlinkErr) {
+        console.error("Error deleting file:", unlinkErr);
+      }
     }
+    
     res.status(500).json({ 
       error: "Processing failed", 
       details: err.message 
     });
   }
 });
+
 
 
 
