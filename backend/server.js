@@ -289,9 +289,6 @@ app.post('/upload', upload.single("file"), async (req, res) => {
 
 
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, '../frontend/dashboard.html'));
-});
 
 app.get("/lessons", async (req, res) => {
   const { data, error } = await supabase.from("lessons").select("*").order("id", { ascending: false }).limit(1);
